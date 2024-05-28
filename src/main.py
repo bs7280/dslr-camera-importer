@@ -3,6 +3,7 @@ import hashlib
 import sqlite3
 from datetime import datetime
 import argparse
+from tqdm import tqdm
 
 def compute_md5(file_path):
     """Compute the MD5 hash of a file."""
@@ -14,10 +15,30 @@ def compute_md5(file_path):
 
 def get_file_creation_time(file_path):
     """Get the file creation datetime."""
-    timestamp = os.path.getctime(file_path)
+    timestamp = os.path.getmtime(file_path)
     return datetime.fromtimestamp(timestamp).isoformat()
 
-def index_photos(directory, database, verbose):
+def write_batch_to_db(cursor, batch_data):
+    """Write batch data to the database."""
+    try:
+        cursor.executemany('''
+            INSERT INTO photo_index (filepath, folder, filename, md5_hash, creation_time)
+            VALUES (?, ?, ?, ?, ?)
+        ''', batch_data)
+    except sqlite3.IntegrityError as e:
+        print(f"Error inserting batch: {e}")
+        for item in batch_data:
+            try:
+                cursor.execute('''
+                    INSERT INTO photo_index (filepath, folder, filename, md5_hash, creation_time)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', item)
+            except sqlite3.IntegrityError as e:
+                print(f"Error inserting file: {item[0]} with MD5 hash: {item[3]} - {e}")
+
+
+
+def index_photos(directory, database, verbose, batch_size=100):
     """Index all RAW photos in the directory."""
     raw_extensions = {'.cr2', '.nef', '.arw', '.dng', '.orf', '.raf'}  # Add other RAW file extensions as needed
 
@@ -42,40 +63,45 @@ def index_photos(directory, database, verbose):
 
     batch_data = []
 
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if any(file.lower().endswith(ext) for ext in raw_extensions):
-                file_path = os.path.abspath(os.path.join(root, file))
-                folder = os.path.basename(os.path.dirname(file_path))
-                filename = file
-                md5_hash = compute_md5(file_path)
-                creation_time = get_file_creation_time(file_path)
+    folders = [folder for folder in os.walk(directory)]
+    for root, _, files in tqdm(folders, desc='Folders'):
+        files = [file for file in files if any(file.lower().endswith(ext) for ext in raw_extensions)]
+
+        # Gets iterations folder name to mention in 
+        iter_folder_name = os.path.basename(root)
+        for file in tqdm(files, desc=f'Files: {iter_folder_name}', leave=False):
+            file_path = os.path.abspath(os.path.join(root, file))
+            folder = os.path.basename(os.path.dirname(file_path))
+            filename = file
+            md5_hash = compute_md5(file_path)
+            creation_time = get_file_creation_time(file_path)
+
+
+            if verbose:
+                print(f"Folder: {folder}, Filename: {filename}, MD5 Hash: {md5_hash}, Creation Time: {creation_time}, Filepath: {file_path}")
+            else:
+                # Check if the MD5 hash already exists in the database
+                cursor.execute('SELECT 1 FROM photo_index WHERE md5_hash = ?', (md5_hash,))
+                if cursor.fetchone() is None:
+                    batch_data.append((file_path, folder, filename, md5_hash, creation_time))
                 
-                if verbose:
-                    print(f"Folder: {folder}, Filename: {filename}, MD5 Hash: {md5_hash}, Creation Time: {creation_time}, Filepath: {file_path}")
-                else:
-                    # Check if the MD5 hash already exists
-                    cursor.execute('SELECT 1 FROM photo_index WHERE md5_hash = ?', (md5_hash,))
-                    if cursor.fetchone() is None:
-                        batch_data.append((file_path, folder, filename, md5_hash, creation_time))
+                # Check for duplicates within the batch
+                batch_md5_hashes = [item[3] for item in batch_data]
+                if batch_md5_hashes.count(md5_hash) > 1:
+                    print(f"Duplicate file in batch: {file_path} with MD5 hash: {md5_hash}")
+                    batch_data = [item for item in batch_data if item[3] != md5_hash]
                 
                 # Batch insert if the batch size is reached
-                if len(batch_data) >= 100:
-                    cursor.executemany('''
-                        INSERT INTO photo_index (filepath, folder, filename, md5_hash, creation_time)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', batch_data)
+                if not verbose and len(batch_data) >= batch_size:
+                    write_batch_to_db(cursor, batch_data)
                     conn.commit()
                     batch_data.clear()
 
     # Insert any remaining data
     if batch_data:
-        cursor.executemany('''
-            INSERT INTO photo_index (filepath, folder, filename, md5_hash, creation_time)
-            VALUES (?, ?, ?, ?, ?)
-        ''', batch_data)
+        write_batch_to_db(cursor, batch_data)
         conn.commit()
-    
+
     if not verbose:
         conn.close()
 
@@ -112,7 +138,8 @@ if __name__ == "__main__":
     parser_index.add_argument("directory", type=str, help="The directory to scan for RAW photos.")
     parser_index.add_argument("--database", type=str, default=DEFAULT_INDEX_DB, help="The SQLite database file.")
     parser_index.add_argument("--verbose", action="store_true", default=False, help="Print the photo information instead of writing to the database.")
-    
+    parser_index.add_argument("--batch-size", type=int, default=100, help="The batch size for database insertion.")
+
     # Import command
     parser_import = subparsers.add_parser("import", help="Import photos from an SD card and check against the existing index.")
     parser_import.add_argument("sd_card_directory", type=str, help="The SD card directory to scan for RAW photos.")
