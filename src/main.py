@@ -129,7 +129,7 @@ def import_photos(sd_card_directory, database):
 
 if __name__ == "__main__":
 
-    DEFAULT_INDEX_DB="data/photo_index.db.sqlite"
+    DEFAULT_INDEX_DB="data/photo_db_real.db.sqlite"
 
     parser = argparse.ArgumentParser(description="Manage and index RAW photos.")
     subparsers = parser.add_subparsers(dest="command")
